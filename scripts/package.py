@@ -36,10 +36,10 @@ def run_entry(code_dir, data, out, main_data=None):
     mapping = {"/data": str(data), "/output/submission.csv": str(out)}
     if main_data is not None:
         mapping["/main_data"] = str(main_data)
+    unmapped = [a for a in command if a.startswith("/") and a not in mapping]
     args = [mapping.get(a, a) for a in command]
     if args[0] == "python":
         args[0] = sys.executable
-    unmapped = [a for a in args if a.startswith("/")]
     if unmapped:
         sys.exit(f"reproduce.json uses paths this script can't map: {unmapped}")
     subprocess.run(args, cwd=code_dir, check=True)
@@ -48,12 +48,14 @@ def run_entry(code_dir, data, out, main_data=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--round", default="main")
+    ap.add_argument("--entry", type=Path, default=ROOT / "entry", help="code folder to package")
+    ap.add_argument("--dist", type=Path, help="output folder (default dist/<round>)")
     args = ap.parse_args()
 
     kit = ROOT / "kit" / args.round
     data = kit / "public"
     main_data = ROOT / "kit" / "main" / "public" if args.round != "main" else None
-    dist = ROOT / "dist" / args.round
+    dist = args.dist or ROOT / "dist" / args.round
     if dist.exists():
         shutil.rmtree(dist)
     dist.mkdir(parents=True)
@@ -62,14 +64,14 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         code = Path(tmp) / "entry"
-        shutil.copytree(ROOT / "entry", code, ignore=IGNORE)
+        shutil.copytree(args.entry, code, ignore=IGNORE)
         run_entry(code, data, csv_path, main_data)
 
     subprocess.run([sys.executable, "check_submission.py", str(csv_path), "--data", str(data)],
                    cwd=kit, check=True)
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / "entry"
-        shutil.copytree(ROOT / "entry", src, ignore=IGNORE)
+        shutil.copytree(args.entry, src, ignore=IGNORE)
         subprocess.run([sys.executable, "build_entry.py", "--source", str(src), "--out", str(zip_path)],
                        cwd=kit, check=True)
 

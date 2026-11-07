@@ -130,7 +130,10 @@ def main():
     ap.add_argument("--round", default="main")
     ap.add_argument("--name", default=dt.datetime.now().strftime("v1-%H%M%S"))
     ap.add_argument("--drop", nargs="*", default=[], help="feature-name prefixes to leave out")
-    ap.add_argument("--loss", choices=("binary", "brier"), default="binary")
+    ap.add_argument("--loss", choices=("binary", "brier"), default="brier")
+    ap.add_argument("--extra-round", help="also train on this round's train+validation histories (e.g. main)")
+    ap.add_argument("--tables-from", help="read payout tables from this round instead (fallback)")
+    ap.add_argument("--model-out", type=Path, default=ROOT / "entry" / "model")
     ap.add_argument("--mix", choices=("gbm", "flat"), default="gbm")
     ap.add_argument("--mix-mode", choices=("project", "raw"), default="project")
     ap.add_argument("--no-mix-weight", dest="mix_weight", action="store_false")
@@ -143,18 +146,29 @@ def main():
     ap.add_argument("--colsample", type=float, default=0.5)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--final", action="store_true")
+    ap.add_argument("--skip-eval", action="store_true", help="with --final: skip the 4-fold evaluation")
     args = ap.parse_args()
     t0 = time.time()
 
     public = ROOT / "kit" / args.round / "public"
     cache = ROOT / "runs" / "cache" / args.round
-    tables = payout_tables(public)
+    try:
+        tables = payout_tables(ROOT / "kit" / (args.tables_from or args.round) / "public")
+    except SystemExit as err:  # new round's payouts are not two clean tables per type
+        if args.round == "main":
+            raise
+        print(f"WARNING: {err}; falling back to main-round tables and raw (unprojected) win sizes")
+        tables = payout_tables(ROOT / "kit" / "main" / "public")
+        args.mix_mode = "raw"
     tr, va = Split(public / "train"), Split(public / "validation")
     Ftr, names = features(tr, tables, cache / "train")
     Fva, _ = features(va, tables, cache / "validation")
     keep = [n for n in names if not any(n.startswith(p) for p in args.drop)]
     cols = [names.index(n) for n in keep]
     ctr, cva = conditions(tr, public, "train"), conditions(va, public, "validation")
+    unknown = (set(ctr) | set(cva)) - set(CONDS)
+    if unknown:
+        raise SystemExit(f"unexpected condition names: {sorted(unknown)}")
 
     # truth and frozen-baseline MSE per condition
     tgt = pd.read_csv(public / "validation/targets.csv").set_index("query_id")[COLS]
@@ -171,12 +185,25 @@ def main():
         idx = [e for e in np.argsort([hashlib.md5(x.encode()).hexdigest() for x in va.episodes]) if cva[e] == c]
         for r, e in enumerate(idx):
             fold[e] = r % 4
-            audit[e] = r < 6
+            audit[e] = r < len(idx) // 4
 
     Xtr, wtr, str_, ctr_r, ttr = rows(tr, Ftr, np.ones(len(tr.episodes), bool), ctr)
+    if args.extra_round:  # earlier round's histories, featurised with that round's own payout tables
+        pub2 = ROOT / "kit" / args.extra_round / "public"
+        tables2 = payout_tables(pub2)
+        parts = [(Xtr, wtr, str_, ctr_r, ttr)]
+        for name in ("train", "validation"):
+            sp = Split(pub2 / name)
+            F2, names2 = features(sp, tables2, ROOT / "runs" / "cache" / args.extra_round / name)
+            if names2 != names:
+                raise SystemExit("feature layout differs between rounds")
+            parts.append(rows(sp, F2, np.ones(len(sp.episodes), bool), conditions(sp, pub2, name)))
+            del F2
+        Xtr, wtr, str_, ctr_r, ttr = (np.concatenate(z) for z in zip(*parts))
+        print(f"  + {args.extra_round} histories: {len(Xtr):,} training rows before validation folds")
     oof = np.zeros((E * va.x.shape[1], 5))
     tix_q = np.array([TYPES.index(t) for t in va.types.reshape(-1)])
-    for f in range(4):
+    for f in range(0 if (args.final and args.skip_eval) else 4):
         Xv, wv, sv, cv, tv = rows(va, Fva, fold != f, cva)
         X = np.concatenate([Xtr, Xv])[:, cols]
         cond = np.concatenate([ctr_r, cv])
@@ -191,26 +218,31 @@ def main():
 
     out = ROOT / "runs" / args.name
     out.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(oof, columns=COLS, index=pd.Index(qids, name="query_id")).to_csv(out / "oof.csv")
-    np.save(out / "oof.npy", oof)
-    qaudit = np.repeat(audit, va.x.shape[1])
-    ref_mse = ((ref.loc[qids].to_numpy() - truth) ** 2).mean(1)
+    evaluated = not (args.final and args.skip_eval)
+    if evaluated:
+        pd.DataFrame(oof, columns=COLS, index=pd.Index(qids, name="query_id")).to_csv(out / "oof.csv")
+        np.save(out / "oof.npy", oof)
+        qaudit = np.repeat(audit, va.x.shape[1])
+        ref_mse = ((ref.loc[qids].to_numpy() - truth) ** 2).mean(1)
 
-    def subset_base(mask):  # normalise each subset by the baseline's error on that same subset
-        return {c: ref_mse[mask & (qcond == c)].mean() for c in CONDS}
+        def subset_base(mask):  # normalise each subset by the baseline's error on that same subset
+            return {c: ref_mse[mask & (qcond == c)].mean() for c in CONDS}
 
-    pts, ratios, _ = score(oof, truth, qcond, base_mse)
-    dev_pts, dev_r, _ = score(oof[~qaudit], truth[~qaudit], qcond[~qaudit], subset_base(~qaudit))
-    aud_pts, _, _ = score(oof[qaudit], truth[qaudit], qcond[qaudit], subset_base(qaudit))
-    print(f"\n{args.name}: all {pts:.3f} | dev {dev_pts:.3f} | audit {aud_pts:.3f}   ({time.time() - t0:.0f}s)")
-    print("  ratios " + "  ".join(f"{c} {ratios[c]:.3f}" for c in CONDS))
-    log = ROOT / "runs" / "v1_log.tsv"
-    new = not log.exists()
-    with open(log, "a", encoding="utf-8") as fh:
-        if new:
-            fh.write("time\tname\tall\tdev\taudit\t" + "\t".join(CONDS) + "\targs\n")
-        fh.write(f"{dt.datetime.now():%H:%M}\t{args.name}\t{pts:.3f}\t{dev_pts:.3f}\t{aud_pts:.3f}\t"
-                 + "\t".join(f"{ratios[c]:.4f}" for c in CONDS) + f"\t{' '.join(sys.argv[1:])}\n")
+        pts, ratios, _ = score(oof, truth, qcond, base_mse)
+        dev_pts, dev_r, _ = score(oof[~qaudit], truth[~qaudit], qcond[~qaudit], subset_base(~qaudit))
+        aud_pts, _, _ = score(oof[qaudit], truth[qaudit], qcond[qaudit], subset_base(qaudit))
+        print(f"\n{args.name}: all {pts:.3f} | dev {dev_pts:.3f} | audit {aud_pts:.3f}   ({time.time() - t0:.0f}s)")
+        print("  ratios " + "  ".join(f"{c} {ratios[c]:.3f}" for c in CONDS))
+        import json
+        (out / "score.json").write_text(json.dumps({"all": pts, "dev": dev_pts, "audit": aud_pts,
+                                                    "ratios": ratios, "argv": sys.argv[1:]}, indent=1))
+        log = ROOT / "runs" / "v1_log.tsv"
+        new = not log.exists()
+        with open(log, "a", encoding="utf-8") as fh:
+            if new:
+                fh.write("time\tname\tall\tdev\taudit\t" + "\t".join(CONDS) + "\targs\n")
+            fh.write(f"{dt.datetime.now():%H:%M}\t{args.name}\t{pts:.3f}\t{dev_pts:.3f}\t{aud_pts:.3f}\t"
+                     + "\t".join(f"{ratios[c]:.4f}" for c in CONDS) + f"\t{' '.join(sys.argv[1:])}\n")
 
     if args.final:
         Xv, wv, sv, cv, tv = rows(va, Fva, np.ones(E, bool), cva)
@@ -218,8 +250,8 @@ def main():
         cond, tix = np.concatenate([ctr_r, cv]), np.concatenate([ttr, tv])
         win, size = fit_models(X, np.concatenate([wtr, wv]), np.concatenate([str_, sv]),
                                row_weight(cond, tix, tables, base_mse, args), args)
-        V1Model(win, size, tables, names, keep, args.mix_mode).save(ROOT / "entry" / "model")
-        print("saved final model to entry/model/")
+        V1Model(win, size, tables, names, keep, args.mix_mode).save(args.model_out)
+        print(f"saved final model to {args.model_out}")
 
 
 if __name__ == "__main__":

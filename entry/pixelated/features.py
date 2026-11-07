@@ -20,6 +20,7 @@ PAIR_HL = (1, 2, 4, 6, 12, 24)
 PAIR_EVID_HL = (2, 6, 24)
 TRIPLE_HL = ()  # tested: +0.15, not significant, doubles runtime
 RULE_SETTINGS = ((0.05, 0.02), (0.05, 0.1), (0.15, 0.05))
+TABLE_RHO = ()  # tested: no gain
 
 
 def shift(a, k, fill=0.0):
@@ -205,6 +206,29 @@ def build(x, types, signals, short, tables):
                 post = (1 - rho) * post + rho / R
             add(f"rule_e{eps}_r{rho}", pred)
             add(f"rule_conf_e{eps}_r{rho}", conf)
+
+        # 5d. same filter for WHICH payout table is active: "table 1 iff f(lag a, lag b)",
+        #     updated only on wins, by the likelihood of the observed win size under each table
+        tix0 = np.array([[TYPES.index(t) for t in row] for row in types])
+        tab = tables[tix0]  # [E,M,2,4]
+        size_lik = np.ones((E, M, TT, 2))
+        for z in (0, 1):
+            for c in range(1, 5):
+                size_lik[..., z] = np.where(x == c, tab[:, :, z, c - 1][..., None], size_lik[..., z])
+        for rho in TABLE_RHO:
+            zb = bit.reshape(E, M, TT, R)  # predicted table index per rule
+            kn = np.broadcast_to(known, bit.shape).reshape(E, M, TT, R)
+            post = np.full((E, M, R), 1.0 / R)
+            pz = np.zeros((E, M, TT))
+            for t in range(TT):
+                pz[:, :, t] = (post * np.where(kn[:, :, t], zb[:, :, t], 0.5)).sum(-1)
+                won = W[:, :, t:t + 1] > 0
+                l0, l1 = size_lik[:, :, t, 0:1], size_lik[:, :, t, 1:2]
+                lik = np.where(kn[:, :, t], np.where(zb[:, :, t] > 0, l1, l0), 0.5 * (l0 + l1))
+                post = np.where(won, post * lik, post)
+                post /= post.sum(-1, keepdims=True)
+                post = (1 - rho) * post + rho / R
+            add(f"table_rule_r{rho}", pz)
 
     # 6. episode peers: recent vs long-run win rates, shared EWMA gaps
     epW, epP = W.sum(1, keepdims=True), P.sum(1, keepdims=True)

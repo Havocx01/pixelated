@@ -62,3 +62,20 @@ Round two: `bash scripts/fetch_kit.sh adaptation <id>`, then the same commands w
 |---|---|---|---|---|---|
 | kit pooled baseline | 30.000 | 1.000 | 1.000 | 1.000 | 1.000 |
 | v0 pooled_recent | 30.826 | 0.958 | 1.001 | 0.946 | 0.881 |
+
+## Round two runbook (Sat 9 PM -> Sun 11 AM)
+
+1. Get the adaptation kit's Google Drive file ID from the organizers' announcement.
+2. Run, from the repo root:
+
+   ```bash
+   bash scripts/round2.sh <google-drive-file-id>
+   ```
+
+   It tags the main entry as `main-final`, downloads and hash-checks the kit, cross-fits
+   "adaptation data only" vs "adaptation + main histories", keeps the better one, fits the
+   final model, writes it into `entry/`, and packages `dist/adaptation/` (with a ZIP rerun
+   that must print `MATCH`). About 25 minutes on this laptop.
+3. Upload `dist/adaptation/submission.csv` and `dist/adaptation/pixelated-entry.zip` through
+   the **Adaptation** Google Form.
+4. Rehearsal without touching anything shipped: `bash scripts/round2.sh --dry-run`.
