@@ -3,22 +3,43 @@
 #   bash scripts/fetch_kit.sh main <google-drive-file-id>
 #   bash scripts/fetch_kit.sh adaptation <google-drive-file-id>
 # Main-round kit id: 1WXrMzPXHv_ZuwpKvdRrcKYoJaMR5J6VV
+# Extracts into a fresh staging folder, requires every file in SHA256.json to
+# exist and match, and only then replaces kit/<round>/. Exits nonzero on failure.
 set -euo pipefail
 ROUND="${1:?round name, e.g. main or adaptation}"
 ID="${2:?google drive file id}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/kit/$ROUND"
+
+if [ -n "${PYTHON:-}" ]; then PY=("$PYTHON")
+elif command -v py >/dev/null 2>&1; then PY=(py -3.13)
+elif command -v python3 >/dev/null 2>&1; then PY=(python3)
+else PY=(python); fi
+
 TMP="$(mktemp -d)"
-curl -sSL -o "$TMP/kit.zip" "https://drive.usercontent.google.com/download?id=$ID&export=download&confirm=t"
-mkdir -p "$DEST"
-unzip -q -o "$TMP/kit.zip" -d "$DEST"
-rm -rf "$TMP"
-cd "$DEST"
-py -3.13 -I -c "
-import hashlib, json, pathlib
-m = json.load(open('SHA256.json'))
-files = m.get('files', m)
-bad = [k for k, v in files.items() if pathlib.Path(k).exists() and hashlib.sha256(pathlib.Path(k).read_bytes()).hexdigest() != v]
-print('kit verified' if not bad else f'HASH MISMATCH: {bad}')
-"
-grep -E '"round"|"max_points"|"season_id"' public/metadata.json
+trap 'rm -rf "$TMP"' EXIT
+curl -fsSL -o "$TMP/kit.zip" "https://drive.usercontent.google.com/download?id=$ID&export=download&confirm=t"
+mkdir "$TMP/stage"
+unzip -q "$TMP/kit.zip" -d "$TMP/stage"
+
+"${PY[@]}" -I - "$TMP/stage" <<'EOF'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+manifest = json.loads((root / "SHA256.json").read_text(encoding="utf-8"))
+files = manifest.get("files", manifest)
+problems = []
+for name, digest in files.items():
+    p = root / name
+    if not p.is_file():
+        problems.append(f"missing {name}")
+    elif hashlib.sha256(p.read_bytes()).hexdigest() != digest:
+        problems.append(f"hash mismatch {name}")
+if problems:
+    sys.exit("KIT VERIFICATION FAILED:\n  " + "\n  ".join(problems))
+print(f"kit verified: {len(files)} files")
+EOF
+
+rm -rf "$DEST"
+mkdir -p "$(dirname "$DEST")"
+mv "$TMP/stage" "$DEST"
+grep -E '"round"|"max_points"|"season_id"' "$DEST/public/metadata.json"

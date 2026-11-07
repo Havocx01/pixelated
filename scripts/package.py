@@ -13,6 +13,7 @@ Outputs land in dist/<round>/.
 
 import argparse
 import hashlib
+import json
 import shutil
 import subprocess
 import sys
@@ -28,9 +29,20 @@ def sha(p):
     return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 
 
-def run_entry(code_dir, data, out):
-    subprocess.run([sys.executable, "predict.py", "--data", str(data), "--out", str(out)],
-                   cwd=code_dir, check=True)
+def run_entry(code_dir, data, out, main_data=None):
+    """Run the exact command from code_dir/reproduce.json, mapping the runner's
+    mount points (/data, /main_data, /output/submission.csv) to local paths."""
+    command = json.loads((Path(code_dir) / "reproduce.json").read_text(encoding="utf-8"))["command"]
+    mapping = {"/data": str(data), "/output/submission.csv": str(out)}
+    if main_data is not None:
+        mapping["/main_data"] = str(main_data)
+    args = [mapping.get(a, a) for a in command]
+    if args[0] == "python":
+        args[0] = sys.executable
+    unmapped = [a for a in args if a.startswith("/")]
+    if unmapped:
+        sys.exit(f"reproduce.json uses paths this script can't map: {unmapped}")
+    subprocess.run(args, cwd=code_dir, check=True)
 
 
 def main():
@@ -40,6 +52,7 @@ def main():
 
     kit = ROOT / "kit" / args.round
     data = kit / "public"
+    main_data = ROOT / "kit" / "main" / "public" if args.round != "main" else None
     dist = ROOT / "dist" / args.round
     if dist.exists():
         shutil.rmtree(dist)
@@ -50,7 +63,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         code = Path(tmp) / "entry"
         shutil.copytree(ROOT / "entry", code, ignore=IGNORE)
-        run_entry(code, data, csv_path)
+        run_entry(code, data, csv_path, main_data)
 
     subprocess.run([sys.executable, "check_submission.py", str(csv_path), "--data", str(data)],
                    cwd=kit, check=True)
@@ -64,7 +77,7 @@ def main():
         unpacked = Path(tmp) / "unzipped"
         zipfile.ZipFile(zip_path).extractall(unpacked)
         again = Path(tmp) / "again.csv"
-        run_entry(unpacked, data, again)
+        run_entry(unpacked, data, again, main_data)
         same = sha(again) == sha(csv_path)
 
     print(f"\nCSV : {csv_path}  sha256 {sha(csv_path)}")
