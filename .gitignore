@@ -1,0 +1,13 @@
+# Organizer kits (download with scripts/fetch_kit.sh; not ours to redistribute)
+kit/
+
+# Generated outputs
+runs/*
+!runs/log.tsv
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/

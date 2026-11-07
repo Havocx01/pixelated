@@ -1,0 +1,19 @@
+[project]
+name = "pixelated"
+version = "0.1.0"
+description = "House Edge slot-machine forecasting, TAMU Datathon 2026"
+requires-python = ">=3.13,<3.14"
+dependencies = []
+
+# Exploration only. The submitted entry/ must stay standard-library only.
+[dependency-groups]
+dev = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "matplotlib",
+    "ipykernel",
+]
+
+[tool.uv]
+package = false
