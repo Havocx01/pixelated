@@ -16,7 +16,10 @@ WINDOWS = (8, 16, 32, 64, T)
 EWMA_HL = (3, 8, 24, 72)
 MIX_HL = (8, 24, 72, 1e9)
 SELF_HL = (1, 1.5, 2, 3, 4, 6, 8, 10, 16, 32, 64, 128)
-PAIR_HL = (2, 6, 24)
+PAIR_HL = (1, 2, 4, 6, 12, 24)
+PAIR_EVID_HL = (2, 6, 24)
+TRIPLE_HL = ()  # tested: +0.15, not significant, doubles runtime
+RULE_SETTINGS = ((0.05, 0.02), (0.05, 0.1), (0.15, 0.05))
 
 
 def shift(a, k, fill=0.0):
@@ -134,12 +137,74 @@ def build(x, types, signals, short, tables):
             stack = np.stack(series)  # [8, E, M, T]
             cur = (S[a] == 1) * 0 + (S[a] == -1) * 2 + (S[b] == -1) * 1  # combo index 0..3
             ok = (S[a] != 0) & (S[b] != 0)
+            pr = {}
             for hl in PAIR_HL:
                 d = disc(stack, hl)
                 wins = np.take_along_axis(d[0::2], cur[None], 0)[0]
                 tries = np.take_along_axis(d[1::2], cur[None], 0)[0]
-                prate = np.where(ok, (wins + 2.0 * base) / (tries + 2.0), np.nan)
-                add(f"pair{a}_{b}_hl{hl}", prate)
+                pr[hl] = np.where(ok, (wins + 2.0 * base) / (tries + 2.0), np.nan)
+                add(f"pair{a}_{b}_hl{hl}", pr[hl])
+                if hl in PAIR_EVID_HL:
+                    add(f"pairn{a}_{b}_hl{hl}", np.where(ok, tries, np.nan))
+            add(f"pairdiff{a}_{b}", pr[PAIR_HL[0]] - pr[PAIR_HL[-1]])
+            # most recent tick with the same context: how long ago, and did it win?
+            ticks = np.arange(TT)
+            last = np.stack([np.maximum.accumulate(np.where(stack[2 * c + 1] > 0, ticks, -1), axis=-1)
+                             for c in range(4)])
+            last = np.concatenate([np.full(last.shape[:-1] + (1,), -1), last[..., :-1]], axis=-1)
+            lsel = np.take_along_axis(last, cur[None], 0)[0]
+            found = ok & (lsel >= 0)
+            add(f"pairage{a}_{b}", np.where(found, ticks - lsel, np.nan))
+            lwin = np.take_along_axis(W, np.clip(lsel, 0, None), -1)
+            add(f"pairlast{a}_{b}", np.where(found, lwin, np.nan))
+
+    # 5b. triple contexts (lags a<b<c), fewer memory lengths
+    for a in LAGS:
+        for b in LAGS:
+            for c in LAGS:
+                if not a < b < c or not TRIPLE_HL:
+                    continue
+                series = []
+                for sa in (1, -1):
+                    for sb in (1, -1):
+                        for sc in (1, -1):
+                            ind = ((S[a] == sa) & (S[b] == sb) & (S[c] == sc)).astype(np.float64)
+                            series += [ind * W, ind * P]
+                stack = np.stack(series)
+                cur = (S[a] == -1) * 4 + (S[b] == -1) * 2 + (S[c] == -1) * 1
+                ok = (S[a] != 0) & (S[b] != 0) & (S[c] != 0)
+                for hl in TRIPLE_HL:
+                    d = disc(stack, hl)
+                    wins = np.take_along_axis(d[0::2], cur[None], 0)[0]
+                    tries = np.take_along_axis(d[1::2], cur[None], 0)[0]
+                    add(f"tri{a}_{b}_{c}_hl{hl}", np.where(ok, (wins + 2.0 * base) / (tries + 2.0), np.nan))
+
+    # 5c. rule detector: Bayesian filter over "win iff f(state at lag a, state at lag b)"
+    #     for every lag pair and all 16 Boolean maps f, with occasional rule switches
+    if RULE_SETTINGS:
+        pairs = [(a, b) for a in LAGS for b in LAGS if a < b]
+        combo = np.stack([np.where((S[a] != 0) & (S[b] != 0),
+                                   (S[a] == -1) * 2 + (S[b] == -1) * 1, -1) for a, b in pairs], -1)  # [E,M,T,28]
+        maps = np.array([[(m >> c) & 1 for c in range(4)] for m in range(16)], dtype=np.float64)  # [16,4]
+        bit = maps[:, np.clip(combo, 0, 3)]  # [16,E,M,T,28]
+        bit = np.moveaxis(bit, 0, -1)  # [E,M,T,28,16]
+        known = (combo >= 0)[..., None]
+        R = len(pairs) * 16
+        for eps, rho in RULE_SETTINGS:
+            q = np.where(known, np.where(bit > 0, 1 - eps, eps), 0.5).reshape(E, M, TT, R)
+            post = np.full((E, M, R), 1.0 / R)
+            pred = np.zeros((E, M, TT))
+            conf = np.zeros((E, M, TT))
+            for t in range(TT):
+                pred[:, :, t] = (post * q[:, :, t]).sum(-1)
+                conf[:, :, t] = post.max(-1)
+                obs = P[:, :, t:t + 1] > 0
+                lik = np.where(W[:, :, t:t + 1] > 0, q[:, :, t], 1 - q[:, :, t])
+                post = np.where(obs, post * lik, post)
+                post /= post.sum(-1, keepdims=True)
+                post = (1 - rho) * post + rho / R
+            add(f"rule_e{eps}_r{rho}", pred)
+            add(f"rule_conf_e{eps}_r{rho}", conf)
 
     # 6. episode peers: recent vs long-run win rates, shared EWMA gaps
     epW, epP = W.sum(1, keepdims=True), P.sum(1, keepdims=True)
