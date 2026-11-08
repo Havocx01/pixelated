@@ -2,6 +2,7 @@
 # Download and verify a House Edge participant kit into kit/<round>/.
 #   bash scripts/fetch_kit.sh main <google-drive-file-id>
 #   bash scripts/fetch_kit.sh adaptation <google-drive-file-id>
+#   bash scripts/fetch_kit.sh adaptation path/to/downloaded-kit.zip   (if the download is blocked)
 # Main-round kit id: 1WXrMzPXHv_ZuwpKvdRrcKYoJaMR5J6VV
 # Extracts into a fresh staging folder, requires every file in SHA256.json to
 # exist and match, and only then replaces kit/<round>/. Exits nonzero on failure.
@@ -18,7 +19,11 @@ else PY=(python); fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-curl -fsSL -o "$TMP/kit.zip" "https://drive.usercontent.google.com/download?id=$ID&export=download&confirm=t"
+if [ -f "$ID" ]; then   # a kit ZIP downloaded by hand (e.g. the Drive link blocked curl)
+  cp "$ID" "$TMP/kit.zip"
+else
+  curl -fsSL -o "$TMP/kit.zip" "https://drive.usercontent.google.com/download?id=$ID&export=download&confirm=t"
+fi
 mkdir "$TMP/stage"
 unzip -q "$TMP/kit.zip" -d "$TMP/stage"
 

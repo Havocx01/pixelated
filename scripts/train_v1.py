@@ -32,6 +32,45 @@ from pixelated.features import PAYOUTS, TYPES, build  # noqa: E402
 from pixelated.v1 import V1Model  # noqa: E402
 
 COLS = [f"p_{p}" for p in PAYOUTS]
+
+
+def stamp(msg):
+    """Timestamped progress line (flushed, so tee'd logs stay live)."""
+    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
+
+def open_live(out):
+    """DVCLive tracker for this run (dev-only dependency; tracking is skipped if absent)."""
+    try:
+        import dvclive.live as dvclive_live
+        from dvclive import Live
+    except ImportError:
+        stamp("dvclive not installed: experiment tracking skipped")
+        return None
+
+    # dvclive 3.x calls `dvc init` (creating and git-staging .dvc/ and .dvcignore) when the
+    # checkout has no DVC repo. We only want local metric files, so look up an existing
+    # repo and never create one.
+    def existing_dvc_repo():
+        from dvc.exceptions import NotDvcRepoError
+        from dvc.repo import Repo
+        from dvc.scm import SCMError
+        try:
+            return Repo()
+        except (NotDvcRepoError, SCMError):
+            return None
+
+    dvclive_live.get_dvc_repo = existing_dvc_repo
+    # one folder per invocation, so re-running a name never wipes an earlier run's metrics
+    run_dir = out / "dvclive" / dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return Live(dir=str(run_dir), save_dvc_exp=False, dvcyaml=False)
+
+
+def feature_settings():
+    import pixelated.features as fe
+    keys = ("LAGS", "ONEHOT_LAGS", "WINDOWS", "EWMA_HL", "MIX_HL", "SELF_HL", "PAIR_HL",
+            "PAIR_EVID_HL", "TRIPLE_HL", "RULE_SETTINGS", "TABLE_RHO")
+    return {k: str(getattr(fe, k)) for k in keys if hasattr(fe, k)}
 CONDS = ("stable", "short_history", "drift", "shared_change")
 
 
@@ -149,20 +188,32 @@ def main():
     ap.add_argument("--skip-eval", action="store_true", help="with --final: skip the 4-fold evaluation")
     args = ap.parse_args()
     t0 = time.time()
+    stamp(f"start {args.name} (round {args.round})")
+    out = ROOT / "runs" / args.name
+    out.mkdir(parents=True, exist_ok=True)
+    live = open_live(out)
 
     public = ROOT / "kit" / args.round / "public"
     cache = ROOT / "runs" / "cache" / args.round
+    tables_source = args.tables_from or args.round
     try:
-        tables = payout_tables(ROOT / "kit" / (args.tables_from or args.round) / "public")
+        tables = payout_tables(ROOT / "kit" / tables_source / "public")
     except SystemExit as err:  # new round's payouts are not two clean tables per type
         if args.round == "main":
             raise
         print(f"WARNING: {err}; falling back to main-round tables and raw (unprojected) win sizes")
         tables = payout_tables(ROOT / "kit" / "main" / "public")
-        args.mix_mode = "raw"
+        tables_source, args.mix_mode = "main (fallback)", "raw"
+    if live is not None:  # logged after the fallback, so these are the settings actually used
+        live.log_params({"name": args.name, "round": args.round, "extra_round": str(args.extra_round),
+                         "tables_source": tables_source, "argv": " ".join(sys.argv[1:]),
+                         **{f"arg/{k}": str(v) for k, v in vars(args).items()},
+                         **{f"features/{k}": v for k, v in feature_settings().items()}})
+    stamp("stage features: start")
     tr, va = Split(public / "train"), Split(public / "validation")
     Ftr, names = features(tr, tables, cache / "train")
     Fva, _ = features(va, tables, cache / "validation")
+    stamp(f"stage features: end ({len(names)} features)")
     keep = [n for n in names if not any(n.startswith(p) for p in args.drop)]
     cols = [names.index(n) for n in keep]
     ctr, cva = conditions(tr, public, "train"), conditions(va, public, "validation")
@@ -177,6 +228,10 @@ def main():
     truth = tgt.loc[qids].to_numpy()
     qcond = np.repeat(cva, va.x.shape[1])
     base_mse = {c: ((ref.loc[qids].to_numpy() - truth) ** 2).mean(1)[qcond == c].mean() for c in CONDS}
+    ref_mse = ((ref.loc[qids].to_numpy() - truth) ** 2).mean(1)
+
+    def subset_base(mask):  # normalise each subset by the baseline's error on that same subset
+        return {c: ref_mse[mask & (qcond == c)].mean() for c in CONDS}
 
     # 4 condition-stratified folds; 6 audit episodes per condition
     E = len(va.episodes)
@@ -204,6 +259,7 @@ def main():
     oof = np.zeros((E * va.x.shape[1], 5))
     tix_q = np.array([TYPES.index(t) for t in va.types.reshape(-1)])
     for f in range(0 if (args.final and args.skip_eval) else 4):
+        stamp(f"fold {f}: start")
         Xv, wv, sv, cv, tv = rows(va, Fva, fold != f, cva)
         X = np.concatenate([Xtr, Xv])[:, cols]
         cond = np.concatenate([ctr_r, cv])
@@ -214,20 +270,20 @@ def main():
         Xq = model.query_rows(va, Fva)
         sel = np.repeat(fold == f, va.x.shape[1])
         oof[sel] = model.predict_rows(Xq[sel], tix_q[sel])
-        print(f"  fold {f}: {len(X):,} rows, {time.time() - t0:.0f}s")
+        fpts, fratios, _ = score(oof[sel], truth[sel], qcond[sel], subset_base(sel))
+        stamp(f"fold {f}: end  {len(X):,} rows, fold points {fpts:.3f}, {time.time() - t0:.0f}s elapsed")
+        if live is not None:
+            live.log_metric("fold/points", fpts)
+            for c in CONDS:
+                live.log_metric(f"fold/ratio_{c}", fratios[c])
+            live.log_metric("fold/elapsed_s", time.time() - t0)
+            live.next_step()
 
-    out = ROOT / "runs" / args.name
-    out.mkdir(parents=True, exist_ok=True)
     evaluated = not (args.final and args.skip_eval)
     if evaluated:
         pd.DataFrame(oof, columns=COLS, index=pd.Index(qids, name="query_id")).to_csv(out / "oof.csv")
         np.save(out / "oof.npy", oof)
         qaudit = np.repeat(audit, va.x.shape[1])
-        ref_mse = ((ref.loc[qids].to_numpy() - truth) ** 2).mean(1)
-
-        def subset_base(mask):  # normalise each subset by the baseline's error on that same subset
-            return {c: ref_mse[mask & (qcond == c)].mean() for c in CONDS}
-
         pts, ratios, _ = score(oof, truth, qcond, base_mse)
         dev_pts, dev_r, _ = score(oof[~qaudit], truth[~qaudit], qcond[~qaudit], subset_base(~qaudit))
         aud_pts, _, _ = score(oof[qaudit], truth[qaudit], qcond[qaudit], subset_base(qaudit))
@@ -244,14 +300,27 @@ def main():
             fh.write(f"{dt.datetime.now():%H:%M}\t{args.name}\t{pts:.3f}\t{dev_pts:.3f}\t{aud_pts:.3f}\t"
                      + "\t".join(f"{ratios[c]:.4f}" for c in CONDS) + f"\t{' '.join(sys.argv[1:])}\n")
 
+        if live is not None:
+            for k, v in (("cv/all", pts), ("cv/dev", dev_pts), ("cv/audit", aud_pts)):
+                live.log_metric(k, v, plot=False)
+            for c in CONDS:
+                live.log_metric(f"cv/ratio_{c}", ratios[c], plot=False)
+
     if args.final:
+        stamp("stage final fit: start")
         Xv, wv, sv, cv, tv = rows(va, Fva, np.ones(E, bool), cva)
         X = np.concatenate([Xtr, Xv])[:, cols]
         cond, tix = np.concatenate([ctr_r, cv]), np.concatenate([ttr, tv])
         win, size = fit_models(X, np.concatenate([wtr, wv]), np.concatenate([str_, sv]),
                                row_weight(cond, tix, tables, base_mse, args), args)
         V1Model(win, size, tables, names, keep, args.mix_mode).save(args.model_out)
-        print(f"saved final model to {args.model_out}")
+        stamp(f"stage final fit: end, saved model to {args.model_out}")
+
+    if live is not None:
+        live.log_metric("elapsed_s", time.time() - t0, plot=False)
+        live.log_metric("n_features", len(keep), plot=False)
+        live.end()
+    stamp(f"end {args.name} ({time.time() - t0:.0f}s)")
 
 
 if __name__ == "__main__":

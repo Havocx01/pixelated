@@ -72,10 +72,34 @@ Round two: `bash scripts/fetch_kit.sh adaptation <id>`, then the same commands w
    bash scripts/round2.sh <google-drive-file-id>
    ```
 
-   It tags the main entry as `main-final`, downloads and hash-checks the kit, cross-fits
-   "adaptation data only" vs "adaptation + main histories", keeps the better one, fits the
-   final model, writes it into `entry/`, and packages `dist/adaptation/` (with a ZIP rerun
-   that must print `MATCH`). About 25 minutes on this laptop.
-3. Upload `dist/adaptation/submission.csv` and `dist/adaptation/pixelated-entry.zip` through
-   the **Adaptation** Google Form.
-4. Rehearsal without touching anything shipped: `bash scripts/round2.sh --dry-run`.
+   It tags the main entry as `main-final`, downloads and hash-checks the kit, then:
+   - **Safety net (about 1 minute):** packages the main-round model's forecasts for the new
+     test set into `dist/adaptation-safety/`. No training.
+   - Cross-fits "adaptation data only" vs "adaptation + main histories", keeps the better one,
+     fits the final model, writes it into `entry/`, and packages `dist/adaptation/` (with a ZIP
+     rerun that must print `MATCH`). About 25 minutes on this laptop.
+
+   Everything is logged to `runs/logs/r2-<timestamp>.log` (`tail -f` it). The last line says
+   `round2: SUCCESS` or `round2: FAILED with exit code N`.
+3. **If you haven't uploaded anything for round two yet**, upload `dist/adaptation-safety/`
+   through the Adaptation Google Form as soon as the log prints `stage safety net: end`.
+   A missing round-two entry scores zero. Don't upload it over a better build you already
+   submitted: the latest response counts.
+4. When the script prints `round2: SUCCESS` and `Reproduction from ZIP: MATCH`, upload
+   `dist/adaptation/submission.csv` + `pixelated-entry.zip` through the **Adaptation** Form.
+   The main entry can't be affected: each round has its own Form.
+5. Rehearsal without touching anything shipped: `bash scripts/round2.sh --dry-run`.
+
+### If something goes wrong (decide nothing at 3 AM; follow this)
+
+| Symptom | Do this |
+|---|---|
+| `curl` fails / Drive asks to confirm / quota error | Download the kit ZIP in a browser, then `bash scripts/round2.sh path/to/kit.zip` |
+| `KIT VERIFICATION FAILED` | Download again. Never use a kit that fails verification. |
+| `entry/ differs from main-final` on a rerun | A previous refit changed `entry/model`. Restore the main entry with `git checkout main-final -- entry`, then rerun. (Don't commit the half-refit model.) |
+| `entry/ has uncommitted changes` on the first run | Commit the final main entry first (`git status` shows what changed), then rerun |
+| `WARNING: ... falling back to main-round tables and raw (unprojected) win sizes` | Expected if the new round changed the payout tables. Let it finish. |
+| `WARNING: safety net failed` | The main model can't read the new data (new machine type or format). Let the refit run; if that fails too, read the error and the kit's `DATA.md` changes. |
+| Training or packaging fails (`round2: FAILED`) | Upload the safety net if you haven't. Then read the last error in the log. |
+| `MISMATCH - do not upload` | Don't upload that build. A failed build never replaces the previous good `dist/adaptation/` or safety net; those stay in place. |
+| Running past 10:30 AM | Stop fixing. Make sure the latest Form response is a build that printed `MATCH`. Deadline 11 AM Central. |
