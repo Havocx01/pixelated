@@ -63,7 +63,6 @@ class V1Model:
         probs = self.predict_rows(X, tix)
         return dict(zip(split.query_id.reshape(-1), probs.tolist()))
 
-    # ---- persistence: two LightGBM text models + a JSON with everything else
     def save(self, folder):
         folder = Path(folder)
         folder.mkdir(parents=True, exist_ok=True)

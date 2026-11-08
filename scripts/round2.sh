@@ -1,18 +1,5 @@
 #!/usr/bin/env bash
-# Round two (adaptation) in one command.
-#   bash scripts/round2.sh <google-drive-file-id>   real run: fetch kit, refit, package dist/adaptation/
-#   bash scripts/round2.sh path/to/kit.zip          same, from a kit ZIP downloaded by hand
-#   bash scripts/round2.sh --dry-run                rehearsal on the main kit; touches nothing shipped
-#
-# Steps: fetch + verify kit -> safety net (main-round model's forecasts for this round, no
-# training) -> cross-fit (a) adaptation data only and (b) adaptation + main histories -> keep
-# whichever scores higher on adaptation validation -> final fit on all its rows -> write the
-# model into the entry -> package CSV + ZIP and verify reproduction.
-#
-# Builds are packaged into a staging folder and replace the previous build only after the
-# ZIP rerun prints MATCH, so a failed rerun never destroys a good dist/ folder.
-# Everything is streamed to runs/logs/<prefix>-<timestamp>.log (follow it with `tail -f`).
-# The script exits non-zero if any stage (training, selection, packaging) fails.
+# Use --dry-run to rehearse with the main kit.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"

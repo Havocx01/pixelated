@@ -1,15 +1,4 @@
-"""Build the two upload files for a round: the test CSV and the code ZIP.
-
-    py -3.13 scripts/package.py [--round main]
-
-1. Copies entry/ to a clean temp folder and runs it exactly like the organizer
-   runner would (fresh folder, data path passed in), writing the test CSV.
-2. Checks the CSV with the kit's checker.
-3. Builds the code ZIP with the kit's build_entry.py.
-4. Re-runs the code from the built ZIP and confirms it reproduces the CSV
-   byte for byte.
-Outputs land in dist/<round>/.
-"""
+"""Build and verify the round's forecast CSV and code ZIP."""
 
 import argparse
 import hashlib
@@ -45,48 +34,77 @@ def run_entry(code_dir, data, out, main_data=None):
     subprocess.run(args, cwd=code_dir, check=True)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--round", default="main")
-    ap.add_argument("--entry", type=Path, default=ROOT / "entry", help="code folder to package")
-    ap.add_argument("--dist", type=Path, help="output folder (default dist/<round>)")
-    args = ap.parse_args()
-
-    kit = ROOT / "kit" / args.round
+def buildPackage(entry, kit, mainData, staging):
     data = kit / "public"
-    main_data = ROOT / "kit" / "main" / "public" if args.round != "main" else None
-    dist = args.dist or ROOT / "dist" / args.round
-    if dist.exists():
-        shutil.rmtree(dist)
-    dist.mkdir(parents=True)
-    csv_path = dist / "submission.csv"
-    zip_path = dist / "pixelated-entry.zip"
+    csvPath = staging / "submission.csv"
+    zipPath = staging / "pixelated-entry.zip"
 
     with tempfile.TemporaryDirectory() as tmp:
-        code = Path(tmp) / "entry"
-        shutil.copytree(args.entry, code, ignore=IGNORE)
-        run_entry(code, data, csv_path, main_data)
+        codeDir = Path(tmp) / "entry"
+        shutil.copytree(entry, codeDir, ignore=IGNORE)
+        run_entry(codeDir, data, csvPath, mainData)
 
-    subprocess.run([sys.executable, "check_submission.py", str(csv_path), "--data", str(data)],
-                   cwd=kit, check=True)
+    subprocess.run([sys.executable, "check_submission.py", str(csvPath), "--data", str(data)], cwd=kit, check=True)
     with tempfile.TemporaryDirectory() as tmp:
-        src = Path(tmp) / "entry"
-        shutil.copytree(args.entry, src, ignore=IGNORE)
-        subprocess.run([sys.executable, "build_entry.py", "--source", str(src), "--out", str(zip_path)],
-                       cwd=kit, check=True)
+        source = Path(tmp) / "entry"
+        shutil.copytree(entry, source, ignore=IGNORE)
+        subprocess.run([sys.executable, "build_entry.py", "--source", str(source), "--out", str(zipPath)], cwd=kit, check=True)
 
     with tempfile.TemporaryDirectory() as tmp:
         unpacked = Path(tmp) / "unzipped"
-        zipfile.ZipFile(zip_path).extractall(unpacked)
-        again = Path(tmp) / "again.csv"
-        run_entry(unpacked, data, again, main_data)
-        same = sha(again) == sha(csv_path)
+        with zipfile.ZipFile(zipPath) as archive:
+            archive.extractall(unpacked)
+        rerun = Path(tmp) / "rerun.csv"
+        run_entry(unpacked, data, rerun, mainData)
+        if sha(rerun) != sha(csvPath):
+            sys.exit("Reproduction from ZIP: MISMATCH - do not upload")
+    return csvPath, zipPath
 
-    print(f"\nCSV : {csv_path}  sha256 {sha(csv_path)}")
-    print(f"ZIP : {zip_path}  ({zip_path.stat().st_size:,} bytes)")
-    print("Reproduction from ZIP:", "MATCH" if same else "MISMATCH - do not upload")
-    if not same:
-        sys.exit(1)
+
+def publishPackage(files, dist):
+    dist.mkdir(parents=True, exist_ok=True)
+    backups = {}
+    for staged in files:
+        target = dist / staged.name
+        if target.exists():
+            backups[target] = staged.with_name(f"previous-{staged.name}")
+            shutil.copy2(target, backups[target])
+
+    published = []
+    try:
+        for staged in files:
+            target = dist / staged.name
+            staged.replace(target)
+            published.append(target)
+    except OSError:
+        for target in published:
+            if target in backups:
+                backups[target].replace(target)
+            else:
+                target.unlink()
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--round", default="main")
+    parser.add_argument("--entry", type=Path, default=ROOT / "entry", help="code folder to package")
+    parser.add_argument("--dist", type=Path, help="output folder (default dist/<round>)")
+    args = parser.parse_args()
+
+    kit = ROOT / "kit" / args.round
+    mainData = ROOT / "kit" / "main" / "public" if args.round != "main" else None
+    dist = (args.dist or ROOT / "dist" / args.round).absolute()
+    dist.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=dist.parent) as staging:
+        files = buildPackage(args.entry, kit, mainData, Path(staging))
+        publishPackage(files, dist)
+
+    csvPath = dist / "submission.csv"
+    zipPath = dist / "pixelated-entry.zip"
+    print(f"\nCSV : {csvPath}  sha256 {sha(csvPath)}")
+    print(f"ZIP : {zipPath}  ({zipPath.stat().st_size:,} bytes)")
+    print("Reproduction from ZIP: MATCH")
 
 
 if __name__ == "__main__":

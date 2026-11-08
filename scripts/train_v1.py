@@ -48,9 +48,7 @@ def open_live(out):
         stamp("dvclive not installed: experiment tracking skipped")
         return None
 
-    # dvclive 3.x calls `dvc init` (creating and git-staging .dvc/ and .dvcignore) when the
-    # checkout has no DVC repo. We only want local metric files, so look up an existing
-    # repo and never create one.
+    # Keep metrics local without letting DVCLive initialize or stage a DVC repo.
     def existing_dvc_repo():
         from dvc.exceptions import NotDvcRepoError
         from dvc.repo import Repo

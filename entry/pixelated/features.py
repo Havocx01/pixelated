@@ -65,6 +65,13 @@ def mix_llr(x, tables_lr, half_life):
     return llr
 
 
+def ruleInputs(maps, context):
+    bits = np.moveaxis(maps[:, np.clip(context, 0, 3)], 0, -1)
+    known = np.broadcast_to((context >= 0)[..., None], bits.shape)
+    episodes, machines = context.shape[:2]
+    return bits.reshape(episodes, machines, -1), known.reshape(episodes, machines, -1)
+
+
 def build(x, types, signals, short, tables):
     """x: int [E, 8, T] payout class 0..4, -1 = missing. types/signals: [E, 8].
     short: bool [E]. tables: float [3 types, 2, 4] win-size mix per table.
@@ -80,13 +87,11 @@ def build(x, types, signals, short, tables):
         feats.append(np.broadcast_to(arr, (E, M, TT)).astype(np.float32))
         names.append(name)
 
-    # 1. recent outcomes by tick lag (missing is its own category)
     for k in ONEHOT_LAGS:
         v = shift(x.astype(np.float64), k, fill=-1.0)
         for c in range(-1, 5):
             add(f"lag{k}_c{c}", (v == c).astype(np.float64))
 
-    # 2. windowed class frequencies
     cum = {c: excum((x == c).astype(np.float64)) for c in range(5)}
     cumP = excum(P)
     for w in WINDOWS:
@@ -95,7 +100,6 @@ def build(x, types, signals, short, tables):
             add(f"freq{w}_c{c}", (cum[c] - shift(cum[c], w) + 0.5) / (n + 2.5))
         add(f"n{w}", n)
 
-    # 3. missing-aware EWMA win rates and their gaps (drift detectors)
     rate = {}
     for hl in EWMA_HL:
         rate[hl] = (disc(W, hl) + 0.5) / (disc(P, hl) + 1.0)
@@ -106,7 +110,6 @@ def build(x, types, signals, short, tables):
     base = (excum(W) + 1.0) / (cumP + 2.0)
     add("winrate_all", base)
 
-    # 4. this machine's own signed lag effects (all-history and recent), times current state
     self_sum = np.zeros((E, M, TT))
     recent_sum = {hl: np.zeros((E, M, TT)) for hl in SELF_HL}
     for k in LAGS:
@@ -123,8 +126,7 @@ def build(x, types, signals, short, tables):
     for hl in SELF_HL:
         add(f"self_sum_recent{hl}", recent_sum[hl])
 
-    # 5. pair contexts: recent win rate on past ticks whose (lag j, lag k) win/lose
-    #    states matched the current ones -- "interacting" lags, rules that change over time
+    # Compare past ticks whose lag-pair states match the current context.
     S = {k: shift(W, k) - shift(L, k) for k in LAGS}
     for a in LAGS:
         for b in LAGS:
@@ -159,7 +161,6 @@ def build(x, types, signals, short, tables):
             lwin = np.take_along_axis(W, np.clip(lsel, 0, None), -1)
             add(f"pairlast{a}_{b}", np.where(found, lwin, np.nan))
 
-    # 5b. triple contexts (lags a<b<c), fewer memory lengths
     for a in LAGS:
         for b in LAGS:
             for c in LAGS:
@@ -180,35 +181,33 @@ def build(x, types, signals, short, tables):
                     tries = np.take_along_axis(d[1::2], cur[None], 0)[0]
                     add(f"tri{a}_{b}_{c}_hl{hl}", np.where(ok, (wins + 2.0 * base) / (tries + 2.0), np.nan))
 
-    # 5c. rule detector: Bayesian filter over "win iff f(state at lag a, state at lag b)"
-    #     for every lag pair and all 16 Boolean maps f, with occasional rule switches
+    # Each lag pair has 16 candidate Boolean rules. The posterior allows occasional switches.
     if RULE_SETTINGS:
         pairs = [(a, b) for a in LAGS for b in LAGS if a < b]
         combo = np.stack([np.where((S[a] != 0) & (S[b] != 0),
                                    (S[a] == -1) * 2 + (S[b] == -1) * 1, -1) for a, b in pairs], -1)  # [E,M,T,28]
         maps = np.array([[(m >> c) & 1 for c in range(4)] for m in range(16)], dtype=np.float64)  # [16,4]
-        bit = maps[:, np.clip(combo, 0, 3)]  # [16,E,M,T,28]
-        bit = np.moveaxis(bit, 0, -1)  # [E,M,T,28,16]
-        known = (combo >= 0)[..., None]
+        # A full timeline of rule inputs can require several GiB.
+        contexts = np.moveaxis(combo, 2, 0)
         R = len(pairs) * 16
         for eps, rho in RULE_SETTINGS:
-            q = np.where(known, np.where(bit > 0, 1 - eps, eps), 0.5).reshape(E, M, TT, R)
             post = np.full((E, M, R), 1.0 / R)
             pred = np.zeros((E, M, TT))
             conf = np.zeros((E, M, TT))
-            for t in range(TT):
-                pred[:, :, t] = (post * q[:, :, t]).sum(-1)
+            for t, context in enumerate(contexts):
+                bits, known = ruleInputs(maps, context)
+                q = np.where(known, np.where(bits > 0, 1 - eps, eps), 0.5)
+                pred[:, :, t] = (post * q).sum(-1)
                 conf[:, :, t] = post.max(-1)
                 obs = P[:, :, t:t + 1] > 0
-                lik = np.where(W[:, :, t:t + 1] > 0, q[:, :, t], 1 - q[:, :, t])
+                lik = np.where(W[:, :, t:t + 1] > 0, q, 1 - q)
                 post = np.where(obs, post * lik, post)
                 post /= post.sum(-1, keepdims=True)
                 post = (1 - rho) * post + rho / R
             add(f"rule_e{eps}_r{rho}", pred)
             add(f"rule_conf_e{eps}_r{rho}", conf)
 
-        # 5d. same filter for WHICH payout table is active: "table 1 iff f(lag a, lag b)",
-        #     updated only on wins, by the likelihood of the observed win size under each table
+        # Only a win reveals which payout table is more likely.
         tix0 = np.array([[TYPES.index(t) for t in row] for row in types])
         tab = tables[tix0]  # [E,M,2,4]
         size_lik = np.ones((E, M, TT, 2))
@@ -216,21 +215,19 @@ def build(x, types, signals, short, tables):
             for c in range(1, 5):
                 size_lik[..., z] = np.where(x == c, tab[:, :, z, c - 1][..., None], size_lik[..., z])
         for rho in TABLE_RHO:
-            zb = bit.reshape(E, M, TT, R)  # predicted table index per rule
-            kn = np.broadcast_to(known, bit.shape).reshape(E, M, TT, R)
             post = np.full((E, M, R), 1.0 / R)
             pz = np.zeros((E, M, TT))
-            for t in range(TT):
-                pz[:, :, t] = (post * np.where(kn[:, :, t], zb[:, :, t], 0.5)).sum(-1)
+            for t, context in enumerate(contexts):
+                bits, known = ruleInputs(maps, context)
+                pz[:, :, t] = (post * np.where(known, bits, 0.5)).sum(-1)
                 won = W[:, :, t:t + 1] > 0
                 l0, l1 = size_lik[:, :, t, 0:1], size_lik[:, :, t, 1:2]
-                lik = np.where(kn[:, :, t], np.where(zb[:, :, t] > 0, l1, l0), 0.5 * (l0 + l1))
+                lik = np.where(known, np.where(bits > 0, l1, l0), 0.5 * (l0 + l1))
                 post = np.where(won, post * lik, post)
                 post /= post.sum(-1, keepdims=True)
                 post = (1 - rho) * post + rho / R
             add(f"table_rule_r{rho}", pz)
 
-    # 6. episode peers: recent vs long-run win rates, shared EWMA gaps
     epW, epP = W.sum(1, keepdims=True), P.sum(1, keepdims=True)
     pW, pP = excum(epW - W), excum(epP - P)
     for w in (8, 32, T):
@@ -239,14 +236,12 @@ def build(x, types, signals, short, tables):
         g = rate[hl_a] - rate[hl_b]
         add(f"peer_gap{hl_a}_{hl_b}", (g.sum(1, keepdims=True) - g) / (M - 1))
 
-    # 7. payout-table evidence (table 1 vs 0) at several memory lengths
     tix = np.array([[TYPES.index(t) for t in row] for row in types])
     lr = np.log(np.maximum(tables[:, 1], 1e-4)) - np.log(np.maximum(tables[:, 0], 1e-4))  # [3, 4]
     lr_m = lr[tix]  # [E, M, 4]
     for hl in MIX_HL:
         add(f"mix_llr{int(min(hl, 9999))}", mix_llr(x, lr_m, hl))
 
-    # 8. static / bookkeeping
     add("type", tix[..., None].astype(np.float64))
     add("signal", np.asarray(signals, dtype=np.float64)[..., None])
     add("tick", np.arange(TT, dtype=np.float64))

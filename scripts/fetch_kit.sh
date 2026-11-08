@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
-# Download and verify a House Edge participant kit into kit/<round>/.
-#   bash scripts/fetch_kit.sh main <google-drive-file-id>
-#   bash scripts/fetch_kit.sh adaptation <google-drive-file-id>
-#   bash scripts/fetch_kit.sh adaptation path/to/downloaded-kit.zip   (if the download is blocked)
-# Main-round kit id: 1WXrMzPXHv_ZuwpKvdRrcKYoJaMR5J6VV
-# Extracts into a fresh staging folder, requires every file in SHA256.json to
-# exist and match, and only then replaces kit/<round>/. Exits nonzero on failure.
+# Verify the archive before installing it in kit/<round>.
 set -euo pipefail
 ROUND="${1:?round name, e.g. main or adaptation}"
 ID="${2:?google drive file id}"

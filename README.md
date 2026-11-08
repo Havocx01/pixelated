@@ -12,13 +12,13 @@ For each query, predict the next spin's probabilities of paying 0x, 1x, 2x, 5x o
 | Score | `points = max / (1 + R)`, R = mean over 4 conditions of our error / pooled baseline error |
 | Baseline | pooled starter scores 30 + 20 = 50; perfect odds score 100 |
 | Conditions | stable, short_history, drift, shared_change (equal weight) |
-| Runner | `python` image (3.13, stdlib), 2 CPU, 16 GiB, 30 min, no network |
+| Runner | `python` image (3.13 with pinned dependencies), 2 CPU, 16 GiB, 30 min, no network |
 | Upload | test CSV + code ZIP through each round's Google Form; latest response before the deadline counts |
 
 ## Layout
 
 ```
-entry/              what gets zipped and rerun by organizers (stdlib only)
+entry/              predictor, pinned dependencies, and saved model packaged for organizers
   predict.py        python predict.py --data /data --out /output/submission.csv
   reproduce.json
   pixelated/        data loading + model
@@ -45,7 +45,7 @@ py -3.13 scripts/validate.py --name <experiment>   # score on validation, logs t
 py -3.13 scripts/package.py                        # build upload files in dist/main/
 ```
 
-Upload `dist/main/submission.csv` and `dist/main/pixelated-entry.zip` to the round's Google Form.
+The selected main-round entry is **c11**. Its matching [forecast CSV](released/submission.csv) and [code ZIP](released/pixelated-entry.zip) are in `released/`. It scored **55.593/60** in main-round cross-validation. The local packaging command above builds the v1.1 fallback from `entry/`.
 
 Round two: `bash scripts/fetch_kit.sh adaptation <id>`, then the same commands with `--round adaptation`.
 
